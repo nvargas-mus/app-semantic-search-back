@@ -1,0 +1,11 @@
+flask
+flask-cors
+requests
+opencv-python
+mediapipe
+numpy
+torch
+Pillow
+filterpy
+scipy
+ultralytics
