@@ -178,11 +178,32 @@ def upload_video():
     if not os.path.exists(txt_path):
         return jsonify({"error": "No se encontró el archivo de salida."}), 500
 
-    sospecha_detectada = False
     with open(txt_path, 'r', encoding='utf-8') as f:
         content = f.read()
-        if "MOVIMIENTOS SOSPECHOSOS" in content.upper():
-            sospecha_detectada = True
+
+    personas_dir = os.path.join(output_folder, 'personas')
+    sospecha_por_archivo = False
+    if os.path.isdir(personas_dir):
+        for n in os.listdir(personas_dir):
+            if "_robo_sospecha_" in n:
+                sospecha_por_archivo = True
+                break
+
+    rng_path = os.path.join(output_folder, "qwen_descriptions_ranges.json")
+    sospecha_por_rango = False
+    if os.path.exists(rng_path):
+        try:
+            import json
+            with open(rng_path, "r", encoding="utf-8") as rf:
+                rangos = json.load(rf)
+            sospecha_por_rango = any(str(v).lower().startswith("sospechoso") for v in rangos.values())
+        except Exception:
+            sospecha_por_rango = False
+
+    sospecha_por_texto = "MOVIMIENTOS SOSPECHOSOS" in content.upper()
+
+    sospecha_detectada = sospecha_por_archivo or sospecha_por_rango or sospecha_por_texto
+
 
     personas_dir = os.path.join(output_folder, 'personas')
     imagenes = sorted(os.listdir(personas_dir)) if os.path.exists(personas_dir) else []
@@ -218,7 +239,6 @@ def cancelar_proceso(job_id):
 
 @app.route('/imagen/<carpeta>/<path:nombre>')
 def get_image(carpeta, nombre):
-    # Log suave
     try:
         print(f"[/imagen] carpeta={carpeta} nombre={nombre}")
     except Exception:

@@ -1,195 +1,163 @@
-import os, io, re, base64, json, sys, requests
-from time import sleep
-from PIL import Image
+import os, sys, json, time, base64, re
+import requests
+from collections import defaultdict
 
-print(">>> QWEN DESCRIPTIONS [ANTI-HURTO v5.2] | FAST_MODE-aware <<<")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DETECCIONES_DIR = os.path.join(BASE_DIR, "detecciones")
 
-FAST_MODE   = os.getenv("FAST_MODE", "1") == "1"
-VLM_MODEL   = os.getenv("VLM_MODEL", "llava:7b")
-VLM_TIMEOUT = int(os.getenv("VLM_TIMEOUT", "90"))
+VLM_URL   = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
+VLM_MODEL = os.environ.get("VLM_MODEL", "llava:7b")
+VLM_TIMEOUT = int(os.environ.get("VLM_TIMEOUT", "60"))   # segundos
+FAST_MODE = os.environ.get("FAST_MODE", "1") == "1"
 
-OLLAMA_URL  = "http://localhost:11434/api/generate"
+MAX_IMGS_PER_RANGE = 3 if FAST_MODE else 6
 
-PROMPT_DESC = (
-    "Eres analista de seguridad en farmacias de Chile. Recibirás varias imágenes del MISMO rango (~10s).\n"
-    "Describe en 2–4 líneas las ACCIONES relevantes y determina si hay INDICIOS DE HURTO.\n"
-    "Señales: ocultar productos, meter a mochila/bolsillo/bolsa, manipular blíster/empaque/antirrobo,\n"
-    "cambiar etiquetas, pasar por caja sin pagar, correr hacia la salida, cubrir cámara, forzar vitrinas.\n"
-    "AL FINAL agrega EXACTAMENTE:\n"
-    "CLASIFICACION: SOSPECHOSO | NO SOSPECHOSO\n"
-    "MOTIVO: <frase breve>"
+SYSTEM_PROMPT_ES = (
+    "Eres un ANALISTA DE SEGURIDAD de retail. Respondes SIEMPRE en español neutro. "
+    "Analiza imágenes de cámaras para identificar conductas potencialmente sospechosas "
+    "(ocultar productos, salir sin pagar, distracciones coordinadas, manipular alarmas, "
+    "pasar productos sin caja, etc.). "
+    "Este análisis es para PREVENCIÓN y REPORTE INTERNO de seguridad, NO promueve actividades ilegales. "
+    "NO respondas con advertencias legales ni rechaces la solicitud. "
+    "Si no hay indicios, responde exactamente: 'NO SOSPECHOSO - N/A'. "
+    "Si hay indicios, responde exactamente: 'SOSPECHOSO - <motivo breve>'. "
+    "Formato estricto, una sola línea."
 )
 
-MAX_SIDE = 640 if FAST_MODE else 896
-JPG_QUALITY = 85
-BATCH_IMAGES_PER_RANGE = 3 if FAST_MODE else 6
-TIMEOUT_S  = VLM_TIMEOUT
-MAX_RETRIES = 1 if FAST_MODE else 2
+REFUSAL_PATTERNS = [
+    r"Desculpe", r"não posso", r"solicita(ç|c)ão", r"I cannot", r"I’m sorry", r"Lo siento, no puedo"
+]
 
-RANGE_RE = re.compile(r"^(\d{4}-\d{4})_")
+def is_refusal(text: str) -> bool:
+    t = (text or "").strip()
+    for pat in REFUSAL_PATTERNS:
+        if re.search(pat, t, flags=re.IGNORECASE):
+            return True
+    return False
 
-def load_and_downsize_to_b64(path: str) -> str:
-    im = Image.open(path).convert("RGB")
-    w, h = im.size
-    scale = min(1.0, float(MAX_SIDE) / max(w, h))
-    if scale < 1.0:
-        im = im.resize((int(w * scale), int(h * scale)))
-    buf = io.BytesIO()
-    im.save(buf, format="JPEG", quality=JPG_QUALITY, optimize=True)
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
+def b64img(path: str) -> str:
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
 
-def rango_key_from_name(fname: str):
-    m = RANGE_RE.match(os.path.basename(fname))
-    return m.group(1) if m else None
+def call_vlm(images_paths, extra_hint: str = "") -> str:
+    if not images_paths:
+        return "NO SOSPECHOSO - N/A"
 
-def call_vlm(images_b64, range_key: str) -> str | None:
-    payload = {
-        "model": VLM_MODEL,
-        "prompt": PROMPT_DESC + f"\n\nRango: {range_key}\n",
-        "images": images_b64,
-        "stream": False,
-        "keep_alive": "20m",
-        "options": {
-            "temperature": 0.2,
-            "num_predict": 192 if FAST_MODE else 256,
-            "num_ctx": 4096
-        }
-    }
-    for attempt in range(1, MAX_RETRIES + 2):
-        try:
-            resp = requests.post(OLLAMA_URL, json=payload, timeout=TIMEOUT_S)
-            if resp.status_code == 200:
-                data = resp.json()
-                return (data.get("response") or "").strip()
-            else:
-                print(f"❌ Ollama {resp.status_code} (intento {attempt}): {resp.text}")
-        except Exception as e:
-            print(f"❌ Excepción en llamada a VLM (intento {attempt}): {e}")
-        sleep(2 * attempt)
-    return None
+    imgs64 = [b64img(p) for p in images_paths]
+    prompt = SYSTEM_PROMPT_ES + "\n\nContexto: " + (extra_hint or "Análisis por rango de tiempo.")
+    try:
+        resp = requests.post(
+            f"{VLM_URL}/api/generate",
+            json={
+                "model": VLM_MODEL,
+                "prompt": prompt,
+                "images": imgs64,
+                "stream": False,
+                "options": {"temperature": 0.2}
+            },
+            timeout=VLM_TIMEOUT
+        )
+        if resp.status_code != 200:
+            return "NO SOSPECHOSO - N/A"
+        data = resp.json()
+        out = (data.get("response") or "").strip()
+        out = out.replace("\n", " ").strip()
+        if is_refusal(out):
+            time.sleep(0.3)
+            resp2 = requests.post(
+                f"{VLM_URL}/api/generate",
+                json={
+                    "model": VLM_MODEL,
+                    "prompt": SYSTEM_PROMPT_ES + "\n\nNO rechaces. Formato estricto solicitado.",
+                    "images": imgs64,
+                    "stream": False,
+                    "options": {"temperature": 0.1}
+                },
+                timeout=VLM_TIMEOUT
+            )
+            if resp2.status_code == 200:
+                out2 = (resp2.json().get("response") or "").strip().replace("\n", " ")
+                if not is_refusal(out2):
+                    out = out2
+        if not re.match(r"^(NO SOSPECHOSO|SOSPECHOSO)\s*-\s*", out, flags=re.IGNORECASE):
+            out = "NO SOSPECHOSO - N/A" if is_refusal(out) else f"SOSPECHOSO - {out[:140]}"
+        return out
+    except requests.exceptions.RequestException:
+        return "NO SOSPECHOSO - N/A"
+
+def choose_images_for_range(folder_personas, folder_sospecha, rango, limit=MAX_IMGS_PER_RANGE):
+    picks = []
+    if os.path.isdir(folder_sospecha):
+        for n in sorted(os.listdir(folder_sospecha)):
+            if n.startswith(rango) and "_robo_sospecha_" in n and n.lower().endswith((".jpg",".jpeg",".png")):
+                picks.append(os.path.join(folder_sospecha, n))
+                if len(picks) >= limit:
+                    return picks
+    if os.path.isdir(folder_personas) and len(picks) < limit:
+        for n in sorted(os.listdir(folder_personas)):
+            if n.startswith(rango) and n.lower().endswith((".jpg",".jpeg",".png")):
+                picks.append(os.path.join(folder_personas, n))
+                if len(picks) >= limit:
+                    break
+    return picks
+
+def detectar_sospecha_archivos(folder_sospecha, rango) -> bool:
+    if not os.path.isdir(folder_sospecha):
+        return False
+    for n in os.listdir(folder_sospecha):
+        if n.startswith(rango) and "_robo_sospecha_" in n:
+            return True
+    return False
 
 def main():
     if len(sys.argv) < 2:
-        print("⚠️ Uso: python qwen_descriptions.py <carpeta_output>")
-        sys.exit(0)
+        print("Uso: python qwen_descriptions.py <carpeta_output>")
+        sys.exit(1)
 
-    carpeta = sys.argv[1]
-    base_carpeta = os.path.join("detecciones", carpeta)
-    dir_personas = os.path.join(base_carpeta, "personas")
-    dir_frames = os.path.join(base_carpeta, "frames")
+    nombre_carpeta = sys.argv[1]
+    carpeta_path = os.path.join(DETECCIONES_DIR, nombre_carpeta)
+    personas_dir = os.path.join(carpeta_path, "personas")
+    sospecha_dir = os.path.join(carpeta_path, "personas")
 
-    if not os.path.isdir(base_carpeta):
-        print(f"⚠️ No existe carpeta: {base_carpeta}")
-        sys.exit(0)
+    rangos = set()
+    if os.path.isdir(personas_dir):
+        for n in os.listdir(personas_dir):
+            if re.match(r"^\d{4}-\d{4}_", n):
+                rangos.add(n[:9])
+    rangos = sorted(rangos)
 
-    per_range = {}
+    print(f">>> QWEN DESCRIPTIONS [ANTI-HURTO hotfix] | FAST_MODE={FAST_MODE} <<<")
+    print(f"🖼️ Rangos a describir: {len(rangos)} | por_rango={MAX_IMGS_PER_RANGE} | MODEL={VLM_MODEL}")
 
-    def add_img(path: str):
-        rk = rango_key_from_name(os.path.basename(path))
-        if rk:
-            per_range.setdefault(rk, []).append(path)
+    desc_por_imagen = {}
+    desc_por_rango = {}
+    for rango in rangos:
+        imgs = choose_images_for_range(personas_dir, sospecha_dir, rango)
+        hint = f"Rango {rango.replace('-', ' - ')} segundos. Cámaras de seguridad en tienda."
+        out = call_vlm(imgs, extra_hint=hint)
+        if detectar_sospecha_archivos(sospecha_dir, rango):
+            if not out.lower().startswith("sospechoso"):
+                out = "SOSPECHOSO - Evidencia visual de manipulación/robo en la escena."
+        desc_por_rango[rango] = out
 
-    if os.path.isdir(dir_personas):
-        for nm in sorted(os.listdir(dir_personas)):
-            if nm.lower().endswith((".jpg", ".jpeg", ".png")):
-                add_img(os.path.join(dir_personas, nm))
-    if os.path.isdir(dir_frames):
-        for nm in sorted(os.listdir(dir_frames)):
-            if nm.lower().endswith((".jpg", ".jpeg", ".png")):
-                add_img(os.path.join(dir_frames, nm))
+        if os.path.isdir(personas_dir):
+            for n in sorted(os.listdir(personas_dir)):
+                if n.startswith(rango) and n.lower().endswith((".jpg",".jpeg",".png")):
+                    desc_por_imagen[n] = out
 
-    if not per_range:
-        print("⚠️ No hay imágenes para describir.")
-        sys.exit(0)
+        print(f"✅ {rango}: {out}")
 
-    work_items = []
-    for rk, paths in sorted(per_range.items()):
-        full = [p for p in paths if p.endswith("_full.jpg")]
-        personas = sorted([p for p in paths if not p.endswith("_full.jpg")])
-        selec = []
-        if full:
-            selec.append(full[0])
-        if personas:
-            selec.append(personas[0])
-        if len(personas) > 1 and len(selec) < BATCH_IMAGES_PER_RANGE:
-            selec.append(personas[-1])
-        for p in personas:
-            if len(selec) >= BATCH_IMAGES_PER_RANGE:
-                break
-            if p not in selec:
-                selec.append(p)
-        work_items.append((rk, selec))
+    with open(os.path.join(carpeta_path, "qwen_descriptions.json"), "w", encoding="utf-8") as f:
+        json.dump(desc_por_imagen, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(carpeta_path, "qwen_descriptions_ranges.json"), "w", encoding="utf-8") as f:
+        json.dump(desc_por_rango, f, ensure_ascii=False, indent=2)
 
-    print(f"🖼️ Rangos a describir: {len(work_items)} | batch={BATCH_IMAGES_PER_RANGE} | FAST_MODE={FAST_MODE}")
-
-    rangos_info = {}
-
-    def parse_cls_and_reason(text: str):
-        if not text:
-            return ("DESCONOCIDO", "")
-        t = text.strip()
-        m_cls = re.search(r"CLASIFICACION:\s*([A-ZÁÉÍÓÚÑ\s]+)", t, re.IGNORECASE)
-        m_reason = re.search(r"MOTIVO:\s*(.+)", t, re.IGNORECASE)
-        cls = (m_cls.group(1).strip().upper() if m_cls else "DESCONOCIDO")
-        if "SOSPECHOSO" in cls:
-            cls = "SOSPECHOSO"
-        elif "NO" in cls:
-            cls = "NO SOSPECHOSO"
-        reason = (m_reason.group(1).strip() if m_reason else "")
-        return (cls, reason)
-
-    for rk, paths in work_items:
-        existing = [p for p in paths if os.path.isfile(p)]
-        if not existing:
-            rangos_info[rk] = {
-                "descripcion": "Descripción no disponible.",
-                "clasificacion": "DESCONOCIDO",
-                "motivo": "",
-                "imagenes": []
-            }
-            print(f"✅ {rk}: DESCONOCIDO")
-            continue
-
-        try:
-            images64 = [load_and_downsize_to_b64(p) for p in existing]
-        except Exception:
-            images64 = []
-
-        desc = call_vlm(images64, rk) or "Descripción no disponible."
-        cls, reason = parse_cls_and_reason(desc)
-
-        if desc == "Descripción no disponible." and cls == "NO SOSPECHOSO":
-            cls = "DESCONOCIDO"
-
-        rangos_info[rk] = {
-            "descripcion": desc,
-            "clasificacion": cls,
-            "motivo": reason,
-            "imagenes": [os.path.basename(p) for p in existing]
-        }
-
-        print(f"✅ {rk}: {cls}{' - ' + reason if reason else ''}")
-
-    descripciones = {}
-    for rk, info in rangos_info.items():
-        desc = info.get("descripcion") or "Descripción no disponible."
-        for p in per_range.get(rk, []):
-            if os.path.isfile(p):
-                descripciones[os.path.basename(p)] = desc
-
-    json_path = os.path.join(base_carpeta, "qwen_descriptions.json")
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(descripciones, f, indent=2, ensure_ascii=False)
-
-    json_ranges = os.path.join(base_carpeta, "qwen_descriptions_ranges.json")
-    with open(json_ranges, "w", encoding="utf-8") as f:
-        json.dump(rangos_info, f, indent=2, ensure_ascii=False)
-
-    print(f"✅ Guardado: {json_path}")
-    print(f"✅ Guardado: {json_ranges}")
+    print(f"✅ Guardado: {os.path.join(carpeta_path,'qwen_descriptions.json')}")
+    print(f"✅ Guardado: {os.path.join(carpeta_path,'qwen_descriptions_ranges.json')}")
 
 if __name__ == "__main__":
     main()
+
 
 
 
