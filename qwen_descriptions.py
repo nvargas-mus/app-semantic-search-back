@@ -1,162 +1,122 @@
-import os, sys, json, time, base64, re
-import requests
-from collections import defaultdict
+import os, sys, json, re, glob, requests
+from pathlib import Path
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DETECCIONES_DIR = os.path.join(BASE_DIR, "detecciones")
+BASE_DIR = Path(__file__).parent
+DETECCIONES = BASE_DIR / "detecciones"
 
-VLM_URL   = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
-VLM_MODEL = os.environ.get("VLM_MODEL", "llava:7b")
-VLM_TIMEOUT = int(os.environ.get("VLM_TIMEOUT", "60"))   # segundos
-FAST_MODE = os.environ.get("FAST_MODE", "1") == "1"
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
+VLM_MODEL  = os.environ.get("VLM_MODEL", "llava:7b")
+TIMEOUT_S  = int(os.environ.get("VLM_TIMEOUT", "90"))
 
-MAX_IMGS_PER_RANGE = 3 if FAST_MODE else 6
-
-SYSTEM_PROMPT_ES = (
-    "Eres un ANALISTA DE SEGURIDAD de retail. Respondes SIEMPRE en español neutro. "
-    "Analiza imágenes de cámaras para identificar conductas potencialmente sospechosas "
-    "(ocultar productos, salir sin pagar, distracciones coordinadas, manipular alarmas, "
-    "pasar productos sin caja, etc.). "
-    "Este análisis es para PREVENCIÓN y REPORTE INTERNO de seguridad, NO promueve actividades ilegales. "
-    "NO respondas con advertencias legales ni rechaces la solicitud. "
-    "Si no hay indicios, responde exactamente: 'NO SOSPECHOSO - N/A'. "
-    "Si hay indicios, responde exactamente: 'SOSPECHOSO - <motivo breve>'. "
-    "Formato estricto, una sola línea."
-)
-
-REFUSAL_PATTERNS = [
-    r"Desculpe", r"não posso", r"solicita(ç|c)ão", r"I cannot", r"I’m sorry", r"Lo siento, no puedo"
+NEGATION_PATTERNS = [
+    r"no puedo ayudar", r"no puedo proporcionar", r"cannot assist", r"policy",
+    r"desculp", r"não posso", r"sorry", r"lo siento", r"no.*puedo.*ayud",
 ]
 
-def is_refusal(text: str) -> bool:
-    t = (text or "").strip()
-    for pat in REFUSAL_PATTERNS:
-        if re.search(pat, t, flags=re.IGNORECASE):
+TASK_INSTR = (
+    "Eres un analista de seguridad minorista. "
+    "A partir de una IMAGEN fija de CCTV, devuelve SOLO una línea en ESPAÑOL, "
+    "sin explicaciones, con este formato EXACTO:\n"
+    "- 'SOSPECHOSO: <motivo breve>' si se observa conducta compatible con hurto "
+    "(ocultar productos, pasarlos a bolsillos/mochila/ropa, vigilar al personal, "
+    "salida apresurada sin pago).\n"
+    "- 'NO SOSPECHOSO' en caso contrario.\n"
+    "Prohibido responder con políticas o disculpas. No cambies de idioma."
+)
+
+def _is_refusal(t: str) -> bool:
+    t = (t or "").lower().strip()
+    if not t:
+        return True
+    for p in NEGATION_PATTERNS:
+        if re.search(p, t):
             return True
     return False
 
-def b64img(path: str) -> str:
-    with open(path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
+def _ollama_image_prompt(img_path_or_url: str) -> str:
+    return f"[IMAGEN]: {img_path_or_url}\n\n{TASK_INSTR}"
 
-def call_vlm(images_paths, extra_hint: str = "") -> str:
-    if not images_paths:
-        return "NO SOSPECHOSO - N/A"
+def _gen(prompt: str) -> str:
+    r = requests.post(
+        f"{OLLAMA_URL}/api/generate",
+        json={"model": VLM_MODEL, "prompt": prompt, "stream": False},
+        timeout=TIMEOUT_S,
+    )
+    r.raise_for_status()
+    return (r.json().get("response") or "").strip()
 
-    imgs64 = [b64img(p) for p in images_paths]
-    prompt = SYSTEM_PROMPT_ES + "\n\nContexto: " + (extra_hint or "Análisis por rango de tiempo.")
-    try:
-        resp = requests.post(
-            f"{VLM_URL}/api/generate",
-            json={
-                "model": VLM_MODEL,
-                "prompt": prompt,
-                "images": imgs64,
-                "stream": False,
-                "options": {"temperature": 0.2}
-            },
-            timeout=VLM_TIMEOUT
-        )
-        if resp.status_code != 200:
-            return "NO SOSPECHOSO - N/A"
-        data = resp.json()
-        out = (data.get("response") or "").strip()
-        out = out.replace("\n", " ").strip()
-        if is_refusal(out):
-            time.sleep(0.3)
-            resp2 = requests.post(
-                f"{VLM_URL}/api/generate",
-                json={
-                    "model": VLM_MODEL,
-                    "prompt": SYSTEM_PROMPT_ES + "\n\nNO rechaces. Formato estricto solicitado.",
-                    "images": imgs64,
-                    "stream": False,
-                    "options": {"temperature": 0.1}
-                },
-                timeout=VLM_TIMEOUT
-            )
-            if resp2.status_code == 200:
-                out2 = (resp2.json().get("response") or "").strip().replace("\n", " ")
-                if not is_refusal(out2):
-                    out = out2
-        if not re.match(r"^(NO SOSPECHOSO|SOSPECHOSO)\s*-\s*", out, flags=re.IGNORECASE):
-            out = "NO SOSPECHOSO - N/A" if is_refusal(out) else f"SOSPECHOSO - {out[:140]}"
-        return out
-    except requests.exceptions.RequestException:
-        return "NO SOSPECHOSO - N/A"
-
-def choose_images_for_range(folder_personas, folder_sospecha, rango, limit=MAX_IMGS_PER_RANGE):
-    picks = []
-    if os.path.isdir(folder_sospecha):
-        for n in sorted(os.listdir(folder_sospecha)):
-            if n.startswith(rango) and "_robo_sospecha_" in n and n.lower().endswith((".jpg",".jpeg",".png")):
-                picks.append(os.path.join(folder_sospecha, n))
-                if len(picks) >= limit:
-                    return picks
-    if os.path.isdir(folder_personas) and len(picks) < limit:
-        for n in sorted(os.listdir(folder_personas)):
-            if n.startswith(rango) and n.lower().endswith((".jpg",".jpeg",".png")):
-                picks.append(os.path.join(folder_personas, n))
-                if len(picks) >= limit:
-                    break
-    return picks
-
-def detectar_sospecha_archivos(folder_sospecha, rango) -> bool:
-    if not os.path.isdir(folder_sospecha):
-        return False
-    for n in os.listdir(folder_sospecha):
-        if n.startswith(rango) and "_robo_sospecha_" in n:
-            return True
-    return False
+def _pick_images(in_dir: Path, max_per_range=3):
+    imgs = sorted([p for p in in_dir.glob("*.jpg")] + [p for p in in_dir.glob("*.png")])
+    by_range = {}
+    for p in imgs:
+        m = re.match(r"^(\d{4}-\d{4})_", p.name)
+        if not m: 
+            continue
+        rg = m.group(1)
+        by_range.setdefault(rg, [])
+        if len(by_range[rg]) < max_per_range:
+            by_range[rg].append(p)
+    return by_range
 
 def main():
     if len(sys.argv) < 2:
         print("Uso: python qwen_descriptions.py <carpeta_output>")
         sys.exit(1)
 
-    nombre_carpeta = sys.argv[1]
-    carpeta_path = os.path.join(DETECCIONES_DIR, nombre_carpeta)
-    personas_dir = os.path.join(carpeta_path, "personas")
-    sospecha_dir = os.path.join(carpeta_path, "personas")
+    nombre = sys.argv[1]
+    carpeta = DETECCIONES / nombre
+    personas_dir = carpeta / "personas"
+    frames_dir   = carpeta / "frames"
 
-    rangos = set()
-    if os.path.isdir(personas_dir):
-        for n in os.listdir(personas_dir):
-            if re.match(r"^\d{4}-\d{4}_", n):
-                rangos.add(n[:9])
-    rangos = sorted(rangos)
+    in_dir = personas_dir if personas_dir.exists() else frames_dir
+    if not in_dir.exists():
+        print(f"❌ No hay imágenes en {personas_dir} ni en {frames_dir}")
+        sys.exit(0)
 
-    print(f">>> QWEN DESCRIPTIONS [ANTI-HURTO hotfix] | FAST_MODE={FAST_MODE} <<<")
-    print(f"🖼️ Rangos a describir: {len(rangos)} | por_rango={MAX_IMGS_PER_RANGE} | MODEL={VLM_MODEL}")
+    by_range = _pick_images(in_dir, max_per_range=3)
 
-    desc_por_imagen = {}
-    desc_por_rango = {}
-    for rango in rangos:
-        imgs = choose_images_for_range(personas_dir, sospecha_dir, rango)
-        hint = f"Rango {rango.replace('-', ' - ')} segundos. Cámaras de seguridad en tienda."
-        out = call_vlm(imgs, extra_hint=hint)
-        if detectar_sospecha_archivos(sospecha_dir, rango):
-            if not out.lower().startswith("sospechoso"):
-                out = "SOSPECHOSO - Evidencia visual de manipulación/robo en la escena."
-        desc_por_rango[rango] = out
+    rango_labels = {}
+    for rg, paths in sorted(by_range.items()):
+        etiqueta = "NO SOSPECHOSO"
+        for p in paths:
+            prompt = _ollama_image_prompt(str(p))
+            try:
+                txt = _gen(prompt)
+                if _is_refusal(txt):
+                    txt = _gen(prompt + "\n\nIMPORTANTE: Contesta solo 'SOSPECHOSO: ...' o 'NO SOSPECHOSO'.")
+                t = txt.strip()
 
-        if os.path.isdir(personas_dir):
-            for n in sorted(os.listdir(personas_dir)):
-                if n.startswith(rango) and n.lower().endswith((".jpg",".jpeg",".png")):
-                    desc_por_imagen[n] = out
+                if t.upper().startswith("SOSPECHOSO"):
+                    etiqueta = "SOSPECHOSO"
+                    dst = carpeta / f"{rg}_robo_sospecha_{p.name}"
+                    try:
+                        if not dst.exists():
+                            dst.write_bytes(p.read_bytes())
+                    except Exception:
+                        pass
+                    break
+            except Exception as e:
+                continue
 
-        print(f"✅ {rango}: {out}")
+        rango_labels[rg] = etiqueta
 
-    with open(os.path.join(carpeta_path, "qwen_descriptions.json"), "w", encoding="utf-8") as f:
-        json.dump(desc_por_imagen, f, ensure_ascii=False, indent=2)
-    with open(os.path.join(carpeta_path, "qwen_descriptions_ranges.json"), "w", encoding="utf-8") as f:
-        json.dump(desc_por_rango, f, ensure_ascii=False, indent=2)
+    (carpeta / "qwen_descriptions_ranges.json").write_text(
+        json.dumps(rango_labels, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
 
-    print(f"✅ Guardado: {os.path.join(carpeta_path,'qwen_descriptions.json')}")
-    print(f"✅ Guardado: {os.path.join(carpeta_path,'qwen_descriptions_ranges.json')}")
+    por_imagen = {p.name: rango_labels.get(re.match(r"^(\d{4}-\d{4})_", p.name).group(1), "NO SOSPECHOSO")
+                  for rg, paths in by_range.items() for p in paths}
+    (carpeta / "qwen_descriptions.json").write_text(
+        json.dumps(por_imagen, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+
+    print("✅ Guardado: qwen_descriptions.json y qwen_descriptions_ranges.json")
 
 if __name__ == "__main__":
     main()
+
 
 
 
