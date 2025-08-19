@@ -1,0 +1,9 @@
+videos
+.venv
+__pycache__
+.venv311
+*.__pycache__
+models
+detecciones
+yolov5m.pt
+yolov5s.pt
